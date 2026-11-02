@@ -225,4 +225,55 @@ async function startRecording() {
     document.body.classList.remove('recording');
     const type = recorder.mimeType || 'audio/webm';
     const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
-    send(new Blob(chunks, { type }), 'r
+    send(new Blob(chunks, { type }), 'rec.' + ext, 0);
+  };
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  const buf = new Uint8Array(analyser.fftSize);
+  const tick = () => {
+    analyser.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (const b of buf) peak = Math.max(peak, Math.abs(b - 128));
+    setLevel(Math.min(peak / 60, 1));
+    rafId = requestAnimationFrame(tick);
+  };
+  tick();
+
+  recorder.start();
+  document.body.classList.add('recording');
+  let left = RECORD_SECONDS;
+  setStatus(`در حال گوش دادن… ${left}`);
+  timerId = setInterval(() => {
+    left -= 1;
+    if (left <= 0) { stopRecording(); return; }
+    setStatus(`در حال گوش دادن… ${left}`);
+  }, 1000);
+}
+
+function stopRecording() {
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+}
+
+$('listen').addEventListener('click', () => {
+  if (document.body.classList.contains('recording')) stopRecording();
+  else startRecording();
+});
+
+$('pick').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', () => {
+  chosenFile = $('file').files[0] || null;
+  if (!chosenFile) return;
+  $('fname').textContent = chosenFile.name;
+  $('fileopts').classList.add('show');
+  resetResult();
+  setStatus('فایل انتخاب شد. اگر آهنگ از ابتدای فایل شروع نمی‌شود، ثانیه‌ی شروع را تغییر دهید.');
+});
+$('go').addEventListener('click', () => {
+  if (chosenFile) send(chosenFile, chosenFile.name, parseFloat($('start').value) || 0);
+});
+</script>
+</body>
+</html>
