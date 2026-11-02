@@ -108,17 +108,24 @@ async def icon(size: int):
 # ---------- تشخیص آهنگ ----------
 
 async def to_wav(src: str, start: float) -> bytes:
+    # خروجی را در یک فایل واقعی می‌نویسیم تا هدر wav درست و کامل باشد
+    out_path = src + ".clip.wav"
     cmd = [
         "ffmpeg", "-y", "-ss", str(max(start, 0)), "-t", str(CLIP_SECONDS),
-        "-i", src, "-vn", "-ac", "1", "-ar", "44100", "-f", "wav", "pipe:1",
+        "-i", src, "-vn", "-ac", "1", "-ar", "44100", out_path,
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
-    out, _ = await proc.communicate()
-    if proc.returncode != 0 or len(out) < 2000:
+    _, err = await proc.communicate()
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        print("ffmpeg error:", err.decode(errors="ignore")[-500:])
         raise ValueError("bad_audio")
-    return out
+    with open(out_path, "rb") as f:
+        data = f.read()
+    if len(data) < 2000:
+        raise ValueError("bad_audio")
+    return data
 
 
 async def recognize_shazam(wav_path: str):
