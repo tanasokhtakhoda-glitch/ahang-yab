@@ -30,7 +30,15 @@
     display: flex; flex-direction: column;
     padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
   }
-  header { padding: 22px 0 0; font-size: 1.25rem; font-weight: 800; }
+  header {
+    padding: 14px 0 0; font-size: 1.25rem; font-weight: 800;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .iconbtn {
+    width: 46px; height: 46px; border-radius: 12px; border: 0; background: transparent;
+    color: var(--ivory); cursor: pointer; display: grid; place-items: center;
+  }
+  .iconbtn svg { width: 28px; height: 28px; }
 
   main {
     flex: 1; display: flex; flex-direction: column; align-items: center;
@@ -52,7 +60,7 @@
     box-shadow: 0 6px 0 var(--firouzeh-deep);
   }
   #listen:active { transform: translateY(3px); box-shadow: 0 3px 0 var(--firouzeh-deep); }
-  #listen:focus-visible, .btn:focus-visible, input:focus-visible { outline: 3px solid var(--saffron); outline-offset: 3px; }
+  #listen:focus-visible, .btn:focus-visible, .iconbtn:focus-visible, input:focus-visible { outline: 3px solid var(--saffron); outline-offset: 3px; }
   #listen svg { width: 64px; height: 64px; }
   #listen .stop { display: none; }
   body.recording #listen .mic { display: none; }
@@ -94,11 +102,39 @@
   .links .btn { flex: 1; border-color: var(--ink); color: var(--ink); padding: 10px 8px; }
   .links .btn.solid { background: var(--saffron); border-color: var(--saffron); }
 
+  /* پنجره‌ی تاریخچه */
+  #hist {
+    position: fixed; inset: 0; z-index: 10; background: var(--firouzeh);
+    display: none; flex-direction: column; overflow-y: auto;
+    padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
+  }
+  #hist.show { display: flex; }
+  .hhead { display: flex; align-items: center; justify-content: space-between; padding: 14px 0 12px; font-size: 1.25rem; font-weight: 800; }
+  #hlist { display: flex; flex-direction: column; gap: 10px; padding-bottom: 20px; }
+  #hempty { text-align: center; color: var(--muted); padding: 40px 0; line-height: 1.8; }
+  .item { background: var(--ivory); color: var(--ink); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .item .info { display: flex; gap: 12px; align-items: center; }
+  .item img { width: 52px; height: 52px; border-radius: 10px; object-fit: cover; flex: none; background: #d8d1bd; }
+  .item .t { font-weight: 800; overflow-wrap: anywhere; }
+  .item .a { color: #36565a; overflow-wrap: anywhere; font-size: .95rem; }
+  .item .d { color: #5b7a7e; font-size: .8rem; }
+  .item .acts { display: flex; gap: 8px; }
+  .item .btn { flex: 1; padding: 8px 6px; font-size: .9rem; border-color: var(--ink); color: var(--ink); }
+  .item .btn.del { flex: none; border-color: #a0443a; color: #a0443a; }
+  #hclear { margin: 0 auto 24px; }
+
   @media (prefers-reduced-motion: reduce) { .ring { transition: none; } }
 </style>
 </head>
 <body>
-<header>آهنگ‌یاب</header>
+<header>
+  <span>آهنگ‌یاب</span>
+  <button class="iconbtn" id="menuBtn" aria-label="تاریخچه‌ی آهنگ‌ها">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16"></path>
+    </svg>
+  </button>
+</header>
 
 <main>
   <div class="stage">
@@ -143,14 +179,105 @@
   </div>
 </main>
 
+<section id="hist" aria-label="تاریخچه">
+  <div class="hhead">
+    <span>تاریخچه‌ی آهنگ‌ها</span>
+    <button class="iconbtn" id="hclose" aria-label="بستن">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"></path>
+      </svg>
+    </button>
+  </div>
+  <div id="hempty">هنوز آهنگی پیدا نشده است.</div>
+  <div id="hlist"></div>
+  <button class="btn" id="hclear" type="button">پاک کردن همه‌ی تاریخچه</button>
+</section>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const RECORD_SECONDS = 12;
+const HIST_KEY = 'ahang-yab-history';
 let recorder, stream, audioCtx, rafId, timerId, chunks = [], chosenFile = null;
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 fetch('/health').catch(() => {});
 
+/* ---------- تاریخچه (روی همین گوشی ذخیره می‌شود) ---------- */
+function loadHist() {
+  try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); } catch (e) { return []; }
+}
+function saveHist(list) {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(list.slice(0, 200))); } catch (e) {}
+}
+function addHist(d) {
+  const list = loadHist();
+  if (list[0] && list[0].title === d.title && list[0].artist === d.artist) {
+    list[0].t = Date.now();
+  } else {
+    list.unshift({
+      title: d.title || '', artist: d.artist || '', cover: d.cover || '',
+      youtube: d.youtube || '', spotify: d.spotify || '', t: Date.now(),
+    });
+  }
+  saveHist(list);
+}
+function fmtDate(ts) {
+  try {
+    const dt = new Date(ts);
+    return dt.toLocaleDateString('fa-IR') + ' - ' + dt.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' });
+  } catch (e) { return ''; }
+}
+function renderHist() {
+  const list = loadHist();
+  const box = $('hlist');
+  box.textContent = '';
+  $('hempty').style.display = list.length ? 'none' : 'block';
+  $('hclear').style.display = list.length ? 'block' : 'none';
+  list.forEach((it, i) => {
+    const el = document.createElement('div');
+    el.className = 'item';
+
+    const info = document.createElement('div');
+    info.className = 'info';
+    if (it.cover) {
+      const img = document.createElement('img');
+      img.src = it.cover; img.alt = '';
+      info.appendChild(img);
+    }
+    const txt = document.createElement('div');
+    const t = document.createElement('div'); t.className = 't'; t.textContent = it.title;
+    const a = document.createElement('div'); a.className = 'a'; a.textContent = it.artist;
+    const d = document.createElement('div'); d.className = 'd'; d.textContent = fmtDate(it.t);
+    txt.append(t, a, d);
+    info.appendChild(txt);
+
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+    const yt = document.createElement('a');
+    yt.className = 'btn'; yt.textContent = 'یوتیوب'; yt.href = it.youtube; yt.target = '_blank'; yt.rel = 'noopener';
+    const sp = document.createElement('a');
+    sp.className = 'btn'; sp.textContent = 'اسپاتیفای'; sp.href = it.spotify; sp.target = '_blank'; sp.rel = 'noopener';
+    const del = document.createElement('button');
+    del.className = 'btn del'; del.type = 'button'; del.textContent = 'حذف';
+    del.addEventListener('click', () => {
+      const cur = loadHist();
+      cur.splice(i, 1);
+      saveHist(cur);
+      renderHist();
+    });
+    acts.append(yt, sp, del);
+
+    el.append(info, acts);
+    box.appendChild(el);
+  });
+}
+$('menuBtn').addEventListener('click', () => { renderHist(); $('hist').classList.add('show'); });
+$('hclose').addEventListener('click', () => $('hist').classList.remove('show'));
+$('hclear').addEventListener('click', () => {
+  if (confirm('همه‌ی تاریخچه پاک شود؟')) { saveHist([]); renderHist(); }
+});
+
+/* ---------- شناسایی ---------- */
 function setStatus(text, isError = false) {
   const s = $('status');
   s.textContent = text;
@@ -177,6 +304,7 @@ function showResult(d) {
   $('sp').href = d.spotify;
   $('result').classList.add('show');
   setStatus('پیدا شد');
+  addHist(d);
 }
 
 async function send(blob, filename, startSec) {
@@ -276,4 +404,4 @@ $('go').addEventListener('click', () => {
 });
 </script>
 </body>
-</html>
+          </html>
