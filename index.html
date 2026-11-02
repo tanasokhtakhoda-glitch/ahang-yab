@@ -90,7 +90,7 @@
 
   #result {
     display: none; width: 100%; max-width: 320px; background: var(--ivory); color: var(--ink);
-    border-radius: 18px; padding: 16px; gap: 14px; flex-direction: column;
+    border-radius: 18px; padding: 16px; gap: 12px; flex-direction: column;
   }
   #result.show { display: flex; }
   .top { display: flex; gap: 14px; align-items: center; }
@@ -101,6 +101,7 @@
   .links { display: flex; gap: 10px; }
   .links .btn { flex: 1; border-color: var(--ink); color: var(--ink); padding: 10px 8px; }
   .links .btn.solid { background: var(--saffron); border-color: var(--saffron); }
+  #copy { border-color: var(--ink); color: var(--ink); padding: 10px 8px; width: 100%; }
 
   /* پنجره‌ی تاریخچه */
   #hist {
@@ -118,9 +119,9 @@
   .item .t { font-weight: 800; overflow-wrap: anywhere; }
   .item .a { color: #36565a; overflow-wrap: anywhere; font-size: .95rem; }
   .item .d { color: #5b7a7e; font-size: .8rem; }
-  .item .acts { display: flex; gap: 8px; }
-  .item .btn { flex: 1; padding: 8px 6px; font-size: .9rem; border-color: var(--ink); color: var(--ink); }
-  .item .btn.del { flex: none; border-color: #a0443a; color: #a0443a; }
+  .item .acts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .item .btn { flex: 1 1 calc(50% - 4px); padding: 8px 6px; font-size: .9rem; border-color: var(--ink); color: var(--ink); }
+  .item .btn.del { border-color: #a0443a; color: #a0443a; }
   #hclear { margin: 0 auto 24px; }
 
   @media (prefers-reduced-motion: reduce) { .ring { transition: none; } }
@@ -163,6 +164,7 @@
       <a class="btn solid" id="yt" target="_blank" rel="noopener">جستجو در یوتیوب</a>
       <a class="btn" id="sp" target="_blank" rel="noopener">جستجو در اسپاتیفای</a>
     </div>
+    <button class="btn" id="copy" type="button">کپی نام خواننده و آهنگ</button>
   </div>
 
   <div id="filebox">
@@ -197,10 +199,42 @@
 const $ = (id) => document.getElementById(id);
 const RECORD_SECONDS = 12;
 const HIST_KEY = 'ahang-yab-history';
-let recorder, stream, audioCtx, rafId, timerId, chunks = [], chosenFile = null;
+let recorder, stream, audioCtx, rafId, timerId, chunks = [], chosenFile = null, current = null;
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 fetch('/health').catch(() => {});
+
+/* ---------- کپی کردن نام خواننده و آهنگ ---------- */
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  ta.remove();
+  return ok;
+}
+async function copyText(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (e) {
+    ok = fallbackCopy(text);
+  }
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = ok ? 'کپی شد' : 'کپی نشد';
+  setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500);
+}
+function songLabel(artist, title) {
+  return [artist, title].filter(Boolean).join(' - ');
+}
+$('copy').addEventListener('click', () => {
+  if (current) copyText(songLabel(current.artist, current.title), $('copy'));
+});
 
 /* ---------- تاریخچه (روی همین گوشی ذخیره می‌شود) ---------- */
 function loadHist() {
@@ -257,6 +291,9 @@ function renderHist() {
     yt.className = 'btn'; yt.textContent = 'یوتیوب'; yt.href = it.youtube; yt.target = '_blank'; yt.rel = 'noopener';
     const sp = document.createElement('a');
     sp.className = 'btn'; sp.textContent = 'اسپاتیفای'; sp.href = it.spotify; sp.target = '_blank'; sp.rel = 'noopener';
+    const cp = document.createElement('button');
+    cp.className = 'btn'; cp.type = 'button'; cp.textContent = 'کپی';
+    cp.addEventListener('click', () => copyText(songLabel(it.artist, it.title), cp));
     const del = document.createElement('button');
     del.className = 'btn del'; del.type = 'button'; del.textContent = 'حذف';
     del.addEventListener('click', () => {
@@ -265,7 +302,7 @@ function renderHist() {
       saveHist(cur);
       renderHist();
     });
-    acts.append(yt, sp, del);
+    acts.append(yt, sp, cp, del);
 
     el.append(info, acts);
     box.appendChild(el);
@@ -292,10 +329,12 @@ function setLevel(v) {
 }
 
 function resetResult() {
+  current = null;
   $('result').classList.remove('show');
 }
 
 function showResult(d) {
+  current = d;
   $('title').textContent = d.title || '';
   $('artist').textContent = d.artist || '';
   const cover = $('cover');
@@ -404,4 +443,4 @@ $('go').addEventListener('click', () => {
 });
 </script>
 </body>
-          </html>
+        </html>
