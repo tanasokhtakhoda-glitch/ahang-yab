@@ -7,9 +7,6 @@
 <title>آهنگ‌یاب</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon-192.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
   :root {
     --firouzeh: #0b5c63;
@@ -26,7 +23,7 @@
   body {
     background: var(--firouzeh);
     color: var(--ivory);
-    font-family: "Vazirmatn", Tahoma, system-ui, sans-serif;
+    font-family: Tahoma, "Noto Sans Arabic", system-ui, sans-serif;
     display: flex; flex-direction: column;
     padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
   }
@@ -197,12 +194,14 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const RECORD_SECONDS = 12;
-const CLIP_SECONDS = 15;          // مقدار صدایی که از فایل بریده می‌شود
-const TARGET_RATE = 16000;        // نرخ نمونه‌برداری فایل کوچک‌شده
-const UPLOAD_TIMEOUT_MS = 100000; // بعد از این مدت، پیام خطا می‌دهد
+const RECORD_SECONDS = 12;          // مدت ضبط با میکروفون
+const CLIP_SECONDS = 15;            // مقداری که از فایل بریده می‌شود
+const AUDIO_BITRATE = 32000;        // کیفیت ضبط (۳۲ کیلوبیت؛ برای شناسایی کافی است)
+const STALL_MS = 12000;             // اگر ارسال این مدت جلو نرفت، قطع و دوباره تلاش می‌شود
+const RESPONSE_TIMEOUT_MS = 120000; // حداکثر انتظار کل برای یک تلاش
+const MAX_TRIES = 3;                // تعداد تلاش برای ارسال
 const SERVER_LIMIT = 30 * 1024 * 1024;
-const MAX_LOCAL_FILE = 150 * 1024 * 1024;
+const MAX_LOCAL_FILE = 80 * 1024 * 1024;
 const HIST_KEY = 'ahang-yab-history';
 let recorder, stream, audioCtx, rafId, timerId, chunks = [], chosenFile = null, current = null;
 
@@ -210,6 +209,7 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 fetch('/health').catch(() => {});
 
 const fa = (n) => Number(n).toLocaleString('fa-IR');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ---------- کپی کردن نام خواننده و آهنگ ---------- */
 function fallbackCopy(text) {
@@ -353,72 +353,86 @@ function showResult(d) {
   addHist(d);
 }
 
-/* ---------- بریدن ۱۵ ثانیه از فایل داخل خود گوشی ---------- */
-function encodeWav(samples, rate) {
-  const buf = new ArrayBuffer(44 + samples.length * 2);
-  const v = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
-  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  w(36, 'data'); v.setUint32(40, samples.length * 2, true);
-  let o = 44;
-  for (let i = 0; i < samples.length; i++, o += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return new Blob([buf], { type: 'audio/wav' });
+/* ---------- ساخت ضبط‌کننده‌ی کم‌حجم ---------- */
+function makeRecorder(mediaStream) {
+  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+  const mimeType = window.MediaRecorder && types.find((t) => MediaRecorder.isTypeSupported(t));
+  const opts = { audioBitsPerSecond: AUDIO_BITRATE };
+  if (mimeType) opts.mimeType = mimeType;
+  return new MediaRecorder(mediaStream, opts);
+}
+function extFor(type) {
+  return type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
 }
 
-async function trimToWav(file, startSec) {
-  const data = await file.arrayBuffer();
+/* ---------- بریدن و کم‌حجم کردن فایل داخل خود گوشی ---------- */
+async function compressFile(file, startSec, onTick) {
   const AC = window.AudioContext || window.webkitAudioContext;
-  let ctx;
-  try { ctx = new AC({ sampleRate: TARGET_RATE }); } catch (e) { ctx = new AC(); }
-  let audio;
-  try { audio = await ctx.decodeAudioData(data); } finally { ctx.close(); }
+  const ctx = new AC();
+  try {
+    const audio = await ctx.decodeAudioData(await file.arrayBuffer());
+    if (startSec >= audio.duration - 1) throw new Error('short');
+    const dur = Math.min(CLIP_SECONDS, audio.duration - startSec);
+    if (ctx.state === 'suspended') await ctx.resume();
 
-  const rate = audio.sampleRate;
-  const from = Math.floor(startSec * rate);
-  const to = Math.min(from + CLIP_SECONDS * rate, audio.length);
-  const n = to - from;
-  if (from >= audio.length || n < rate) throw new Error('short');
+    const dest = ctx.createMediaStreamDestination();
+    try { dest.channelCount = 1; } catch (e) {}
+    const src = ctx.createBufferSource();
+    src.buffer = audio;
+    src.connect(dest);
 
-  const mono = new Float32Array(n);
-  const chs = audio.numberOfChannels;
-  for (let c = 0; c < chs; c++) {
-    const ch = audio.getChannelData(c);
-    for (let i = 0; i < n; i++) mono[i] += ch[from + i] / chs;
+    const rec = makeRecorder(dest.stream);
+    const parts = [];
+    rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
+    const stopped = new Promise((res) => { rec.onstop = res; });
+
+    rec.start();
+    src.start(0, startSec, dur);
+    let left = Math.ceil(dur);
+    const iv = setInterval(() => { left -= 1; if (left > 0) onTick(left); }, 1000);
+    src.onended = () => { if (rec.state !== 'inactive') rec.stop(); };
+    await stopped;
+    clearInterval(iv);
+
+    const type = rec.mimeType || 'audio/webm';
+    return { blob: new Blob(parts, { type }), name: 'clip.' + extFor(type) };
+  } finally {
+    ctx.close();
   }
-  let out = mono, outRate = rate;
-  if (rate > TARGET_RATE) {
-    const ratio = rate / TARGET_RATE;
-    const len = Math.floor(n / ratio);
-    out = new Float32Array(len);
-    for (let i = 0; i < len; i++) out[i] = mono[Math.floor(i * ratio)];
-    outRate = TARGET_RATE;
-  }
-  return encodeWav(out, outRate);
 }
 
-/* ---------- ارسال به سرور با نمایش درصد ---------- */
-function upload(blob, filename, startSec, onPhase) {
+/* ---------- ارسال به سرور (با تشخیص گیر کردن و تلاش دوباره) ---------- */
+function uploadOnce(blob, filename, startSec, onPhase) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/recognize');
-    xhr.timeout = UPLOAD_TIMEOUT_MS;
+    xhr.timeout = RESPONSE_TIMEOUT_MS;
+    let lastProgress = Date.now();
+    let uploading = true;
+    const watch = setInterval(() => {
+      if (uploading && Date.now() - lastProgress > STALL_MS) {
+        clearInterval(watch);
+        xhr.abort();
+        reject(new Error('stall'));
+      }
+    }, 1000);
     xhr.upload.onprogress = (e) => {
+      lastProgress = Date.now();
       if (e.lengthComputable) onPhase('upload', Math.round((e.loaded / e.total) * 100));
     };
-    xhr.upload.onload = () => onPhase('wait', 100);
+    xhr.upload.onload = () => {
+      uploading = false;
+      lastProgress = Date.now();
+      onPhase('wait', 100);
+    };
     xhr.onload = () => {
+      clearInterval(watch);
       let data = null;
       try { data = JSON.parse(xhr.responseText); } catch (e) {}
       resolve({ status: xhr.status, data });
     };
-    xhr.onerror = () => reject(new Error('network'));
-    xhr.ontimeout = () => reject(new Error('timeout'));
+    xhr.onerror = () => { clearInterval(watch); reject(new Error('network')); };
+    xhr.ontimeout = () => { clearInterval(watch); reject(new Error('timeout')); };
     const fd = new FormData();
     fd.append('file', blob, filename);
     fd.append('start', String(startSec || 0));
@@ -437,16 +451,32 @@ async function send(blob, filename, startSec) {
       setStatus('در حال ارسال… ' + fa(pct) + '٪');
     } else if (p === 'wait') {
       setStatus('ارسال شد؛ در حال شناسایی…');
-      if (!wakeTimer) {
-        wakeTimer = setTimeout(() => {
-          if (phase === 'wait') setStatus('سرور رایگان تازه بیدار می‌شود؛ تا یک دقیقه صبر کنید…');
-        }, 9000);
-      }
+      clearTimeout(wakeTimer);
+      wakeTimer = setTimeout(() => {
+        if (phase === 'wait') setStatus('سرور رایگان تازه بیدار می‌شود؛ تا یک دقیقه صبر کنید…');
+      }, 9000);
     }
   };
-  setStatus('در حال ارسال…');
+
   try {
-    const { status, data } = await upload(blob, filename, startSec, onPhase);
+    let res = null;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      try {
+        setStatus(attempt === 1 ? 'در حال ارسال…' : `تلاش دوباره (${fa(attempt)} از ${fa(MAX_TRIES)})…`);
+        res = await uploadOnce(blob, filename, startSec, onPhase);
+        break;
+      } catch (e) {
+        const retryable = e.message === 'stall' || e.message === 'network';
+        if (retryable && attempt < MAX_TRIES) {
+          setStatus(`ارسال قطع شد؛ تلاش دوباره (${fa(attempt + 1)} از ${fa(MAX_TRIES)})…`);
+          await sleep(1500);
+          continue;
+        }
+        throw e;
+      }
+    }
+
+    const { status, data } = res;
     if (status === 413) setStatus('فایل بیشتر از ۳۰ مگابایت است. فایل کوچک‌تری انتخاب کنید.', true);
     else if (status === 422) setStatus('این فایل صدا ندارد یا خوانده نشد. فایل دیگری امتحان کنید.', true);
     else if (status === 504) setStatus('شناسایی بیش از حد طول کشید. کمی بعد دوباره امتحان کنید.', true);
@@ -455,9 +485,9 @@ async function send(blob, filename, startSec) {
     else setStatus('آهنگ پیدا نشد. نزدیک‌تر به منبع صدا ضبط کنید یا از بخش دیگری از آهنگ شروع کنید.', true);
   } catch (e) {
     if (e.message === 'timeout') {
-      setStatus('پاسخی نیامد. اینترنت یا فیلترشکن را بررسی کنید و دوباره امتحان کنید.', true);
+      setStatus('پاسخی نیامد. چند لحظه بعد دوباره امتحان کنید.', true);
     } else {
-      setStatus('اتصال به سرور برقرار نشد. اینترنت یا فیلترشکن را بررسی کنید.', true);
+      setStatus('ارسال کامل نشد؛ اتصال شما به سرور مشکل دارد. فیلترشکن را امتحان کنید.', true);
     }
   } finally {
     clearTimeout(wakeTimer);
@@ -465,6 +495,7 @@ async function send(blob, filename, startSec) {
   }
 }
 
+/* ---------- شناسایی از روی فایل ---------- */
 async function recognizeFile(file, startSec) {
   document.body.classList.add('busy');
   resetResult();
@@ -473,11 +504,14 @@ async function recognizeFile(file, startSec) {
     document.body.classList.remove('busy');
     return;
   }
-  setStatus('در حال آماده‌سازی فایل…');
+  setStatus('در حال آماده‌سازی فایل… (حدود ۱۵ ثانیه)');
   let blob = file, name = file.name, start = startSec;
   try {
-    blob = await trimToWav(file, startSec);
-    name = 'clip.wav';
+    const out = await compressFile(file, startSec, (left) => {
+      setStatus(`در حال آماده‌سازی فایل… ${fa(left)}`);
+    });
+    blob = out.blob;
+    name = out.name;
     start = 0;
   } catch (e) {
     if (e && e.message === 'short') {
@@ -490,7 +524,7 @@ async function recognizeFile(file, startSec) {
       document.body.classList.remove('busy');
       return;
     }
-    // اگر بریدن فایل شکست خورد، فایل اصلی (کوچک) را می‌فرستیم
+    // اگر آماده‌سازی شکست خورد، فایل اصلی (کوچک) را می‌فرستیم
   }
   await send(blob, name, start);
 }
@@ -507,7 +541,7 @@ async function startRecording() {
     return;
   }
   chunks = [];
-  recorder = new MediaRecorder(stream);
+  recorder = makeRecorder(stream);
   recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   recorder.onstop = () => {
     cancelAnimationFrame(rafId);
@@ -517,8 +551,7 @@ async function startRecording() {
     if (audioCtx) audioCtx.close();
     document.body.classList.remove('recording');
     const type = recorder.mimeType || 'audio/webm';
-    const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
-    send(new Blob(chunks, { type }), 'rec.' + ext, 0);
+    send(new Blob(chunks, { type }), 'rec.' + extFor(type), 0);
   };
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -569,4 +602,4 @@ $('go').addEventListener('click', () => {
 });
 </script>
 </body>
-</html>
+  </html>
