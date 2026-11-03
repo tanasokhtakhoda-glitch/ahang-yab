@@ -198,11 +198,18 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const RECORD_SECONDS = 12;
+const CLIP_SECONDS = 15;          // مقدار صدایی که از فایل بریده می‌شود
+const TARGET_RATE = 16000;        // نرخ نمونه‌برداری فایل کوچک‌شده
+const UPLOAD_TIMEOUT_MS = 100000; // بعد از این مدت، پیام خطا می‌دهد
+const SERVER_LIMIT = 30 * 1024 * 1024;
+const MAX_LOCAL_FILE = 150 * 1024 * 1024;
 const HIST_KEY = 'ahang-yab-history';
 let recorder, stream, audioCtx, rafId, timerId, chunks = [], chosenFile = null, current = null;
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 fetch('/health').catch(() => {});
+
+const fa = (n) => Number(n).toLocaleString('fa-IR');
 
 /* ---------- کپی کردن نام خواننده و آهنگ ---------- */
 function fallbackCopy(text) {
@@ -314,7 +321,7 @@ $('hclear').addEventListener('click', () => {
   if (confirm('همه‌ی تاریخچه پاک شود؟')) { saveHist([]); renderHist(); }
 });
 
-/* ---------- شناسایی ---------- */
+/* ---------- نمایش وضعیت ---------- */
 function setStatus(text, isError = false) {
   const s = $('status');
   s.textContent = text;
@@ -346,30 +353,149 @@ function showResult(d) {
   addHist(d);
 }
 
-async function send(blob, filename, startSec) {
-  document.body.classList.add('busy');
-  resetResult();
-  setStatus('در حال شناسایی…');
-  const slow = setTimeout(() => setStatus('سرور رایگان تازه بیدار می‌شود؛ تا یک دقیقه صبر کنید…'), 7000);
-  try {
+/* ---------- بریدن ۱۵ ثانیه از فایل داخل خود گوشی ---------- */
+function encodeWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  let o = 44;
+  for (let i = 0; i < samples.length; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+async function trimToWav(file, startSec) {
+  const data = await file.arrayBuffer();
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ctx;
+  try { ctx = new AC({ sampleRate: TARGET_RATE }); } catch (e) { ctx = new AC(); }
+  let audio;
+  try { audio = await ctx.decodeAudioData(data); } finally { ctx.close(); }
+
+  const rate = audio.sampleRate;
+  const from = Math.floor(startSec * rate);
+  const to = Math.min(from + CLIP_SECONDS * rate, audio.length);
+  const n = to - from;
+  if (from >= audio.length || n < rate) throw new Error('short');
+
+  const mono = new Float32Array(n);
+  const chs = audio.numberOfChannels;
+  for (let c = 0; c < chs; c++) {
+    const ch = audio.getChannelData(c);
+    for (let i = 0; i < n; i++) mono[i] += ch[from + i] / chs;
+  }
+  let out = mono, outRate = rate;
+  if (rate > TARGET_RATE) {
+    const ratio = rate / TARGET_RATE;
+    const len = Math.floor(n / ratio);
+    out = new Float32Array(len);
+    for (let i = 0; i < len; i++) out[i] = mono[Math.floor(i * ratio)];
+    outRate = TARGET_RATE;
+  }
+  return encodeWav(out, outRate);
+}
+
+/* ---------- ارسال به سرور با نمایش درصد ---------- */
+function upload(blob, filename, startSec, onPhase) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/recognize');
+    xhr.timeout = UPLOAD_TIMEOUT_MS;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onPhase('upload', Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.upload.onload = () => onPhase('wait', 100);
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      resolve({ status: xhr.status, data });
+    };
+    xhr.onerror = () => reject(new Error('network'));
+    xhr.ontimeout = () => reject(new Error('timeout'));
     const fd = new FormData();
     fd.append('file', blob, filename);
     fd.append('start', String(startSec || 0));
-    const r = await fetch('/api/recognize', { method: 'POST', body: fd });
-    const d = await r.json();
-    if (r.status === 413) setStatus('فایل بیشتر از ۳۰ مگابایت است. فایل کوچک‌تری انتخاب کنید.', true);
-    else if (r.status === 422) setStatus('این فایل صدا ندارد یا خوانده نشد. فایل دیگری امتحان کنید.', true);
-    else if (!r.ok) setStatus('خطای سرور. چند لحظه بعد دوباره امتحان کنید.', true);
-    else if (d.found) showResult(d);
+    xhr.send(fd);
+  });
+}
+
+async function send(blob, filename, startSec) {
+  document.body.classList.add('busy');
+  resetResult();
+  let phase = 'upload';
+  let wakeTimer = null;
+  const onPhase = (p, pct) => {
+    phase = p;
+    if (p === 'upload') {
+      setStatus('در حال ارسال… ' + fa(pct) + '٪');
+    } else if (p === 'wait') {
+      setStatus('ارسال شد؛ در حال شناسایی…');
+      if (!wakeTimer) {
+        wakeTimer = setTimeout(() => {
+          if (phase === 'wait') setStatus('سرور رایگان تازه بیدار می‌شود؛ تا یک دقیقه صبر کنید…');
+        }, 9000);
+      }
+    }
+  };
+  setStatus('در حال ارسال…');
+  try {
+    const { status, data } = await upload(blob, filename, startSec, onPhase);
+    if (status === 413) setStatus('فایل بیشتر از ۳۰ مگابایت است. فایل کوچک‌تری انتخاب کنید.', true);
+    else if (status === 422) setStatus('این فایل صدا ندارد یا خوانده نشد. فایل دیگری امتحان کنید.', true);
+    else if (status === 504) setStatus('شناسایی بیش از حد طول کشید. کمی بعد دوباره امتحان کنید.', true);
+    else if (status !== 200 || !data) setStatus('خطای سرور. چند لحظه بعد دوباره امتحان کنید.', true);
+    else if (data.found) showResult(data);
     else setStatus('آهنگ پیدا نشد. نزدیک‌تر به منبع صدا ضبط کنید یا از بخش دیگری از آهنگ شروع کنید.', true);
   } catch (e) {
-    setStatus('اتصال به سرور برقرار نشد. اینترنت یا فیلترشکن را بررسی کنید.', true);
+    if (e.message === 'timeout') {
+      setStatus('پاسخی نیامد. اینترنت یا فیلترشکن را بررسی کنید و دوباره امتحان کنید.', true);
+    } else {
+      setStatus('اتصال به سرور برقرار نشد. اینترنت یا فیلترشکن را بررسی کنید.', true);
+    }
   } finally {
-    clearTimeout(slow);
+    clearTimeout(wakeTimer);
     document.body.classList.remove('busy');
   }
 }
 
+async function recognizeFile(file, startSec) {
+  document.body.classList.add('busy');
+  resetResult();
+  if (file.size > MAX_LOCAL_FILE) {
+    setStatus('این فایل خیلی بزرگ است. فایل کوچک‌تری انتخاب کنید.', true);
+    document.body.classList.remove('busy');
+    return;
+  }
+  setStatus('در حال آماده‌سازی فایل…');
+  let blob = file, name = file.name, start = startSec;
+  try {
+    blob = await trimToWav(file, startSec);
+    name = 'clip.wav';
+    start = 0;
+  } catch (e) {
+    if (e && e.message === 'short') {
+      setStatus('ثانیه‌ی شروع از طول فایل بیشتر است. عدد کوچک‌تری بگذارید.', true);
+      document.body.classList.remove('busy');
+      return;
+    }
+    if (file.size > SERVER_LIMIT) {
+      setStatus('این فایل در گوشی خوانده نشد و برای ارسال مستقیم هم بزرگ است.', true);
+      document.body.classList.remove('busy');
+      return;
+    }
+    // اگر بریدن فایل شکست خورد، فایل اصلی (کوچک) را می‌فرستیم
+  }
+  await send(blob, name, start);
+}
+
+/* ---------- ضبط با میکروفون ---------- */
 async function startRecording() {
   resetResult();
   try {
@@ -412,11 +538,11 @@ async function startRecording() {
   recorder.start();
   document.body.classList.add('recording');
   let left = RECORD_SECONDS;
-  setStatus(`در حال گوش دادن… ${left}`);
+  setStatus(`در حال گوش دادن… ${fa(left)}`);
   timerId = setInterval(() => {
     left -= 1;
     if (left <= 0) { stopRecording(); return; }
-    setStatus(`در حال گوش دادن… ${left}`);
+    setStatus(`در حال گوش دادن… ${fa(left)}`);
   }, 1000);
 }
 
@@ -439,8 +565,8 @@ $('file').addEventListener('change', () => {
   setStatus('فایل انتخاب شد. اگر آهنگ از ابتدای فایل شروع نمی‌شود، ثانیه‌ی شروع را تغییر دهید.');
 });
 $('go').addEventListener('click', () => {
-  if (chosenFile) send(chosenFile, chosenFile.name, parseFloat($('start').value) || 0);
+  if (chosenFile) recognizeFile(chosenFile, parseFloat($('start').value) || 0);
 });
 </script>
 </body>
-        </html>
+</html>
