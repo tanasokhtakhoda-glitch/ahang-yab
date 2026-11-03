@@ -19,9 +19,15 @@ from shazamio import Shazam
 BASE = Path(__file__).parent
 MAX_BYTES = 30 * 1024 * 1024  # حداکثر حجم فایل ورودی
 CLIP_SECONDS = 15  # مقدار صدایی که برای تشخیص فرستاده می‌شود
+FFMPEG_TIMEOUT = 40  # حداکثر زمان تبدیل صدا
+TOTAL_TIMEOUT = 75  # حداکثر زمان کل یک شناسایی
 
 app = FastAPI()
 shazam = Shazam()
+
+
+def log(*args):
+    print("[recognize]", *args, flush=True)
 
 
 # ---------- صفحه‌ها و فایل‌های PWA ----------
@@ -115,21 +121,30 @@ async def to_wav(src: str, start: float) -> bytes:
         "-i", src, "-vn", "-ac", "1", "-ar", "44100", out_path,
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    _, err = await proc.communicate()
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=FFMPEG_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        log("ffmpeg timeout")
+        raise ValueError("bad_audio")
     if proc.returncode != 0 or not os.path.exists(out_path):
-        print("ffmpeg error:", err.decode(errors="ignore")[-500:])
+        log("ffmpeg error:", err.decode(errors="ignore")[-500:])
         raise ValueError("bad_audio")
     with open(out_path, "rb") as f:
         data = f.read()
     if len(data) < 2000:
+        log("ffmpeg output too small:", len(data))
         raise ValueError("bad_audio")
     return data
 
 
 async def recognize_shazam(wav_path: str):
-    result = await asyncio.wait_for(shazam.recognize(wav_path), timeout=40)
+    result = await asyncio.wait_for(shazam.recognize(wav_path), timeout=30)
     track = (result or {}).get("track")
     if not track:
         return None
@@ -160,7 +175,7 @@ async def recognize_acr(wav: bytes):
         "data_type": "audio",
         "signature_version": "1",
     }
-    async with httpx.AsyncClient(timeout=40) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"https://{host}/v1/identify", data=data, files={"sample": ("sample.wav", wav)}
         )
@@ -183,38 +198,56 @@ def add_links(info: dict) -> dict:
     return info
 
 
-@app.post("/api/recognize")
-async def recognize(file: UploadFile = File(...), start: float = Form(0)):
-    raw = await file.read()
-    if len(raw) > MAX_BYTES:
-        return JSONResponse({"error": "too_big"}, status_code=413)
-
-    suffix = Path(file.filename or "").suffix or ".bin"
+async def process(raw: bytes, suffix: str, start: float):
+    t0 = time.time()
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "in" + suffix)
         with open(src, "wb") as f:
             f.write(raw)
-        try:
-            wav = await to_wav(src, start)
-        except ValueError:
-            return JSONResponse({"error": "bad_audio"}, status_code=422)
+
+        wav = await to_wav(src, start)
+        log(f"ffmpeg ok, wav={len(wav)} bytes, {time.time() - t0:.1f}s")
 
         wav_path = os.path.join(tmp, "clip.wav")
         with open(wav_path, "wb") as f:
             f.write(wav)
 
         info = None
+        t1 = time.time()
         try:
             info = await recognize_shazam(wav_path)
-        except Exception as e:  # Shazam غیررسمی است؛ خطا را نادیده می‌گیریم و پشتیبان را امتحان می‌کنیم
-            print("shazam error:", repr(e))
+            log(f"shazam done, found={bool(info)}, {time.time() - t1:.1f}s")
+        except Exception as e:  # Shazam غیررسمی است؛ خطا را ثبت می‌کنیم و پشتیبان را امتحان می‌کنیم
+            log("shazam error:", repr(e), f"after {time.time() - t1:.1f}s")
 
         if not info:
+            t2 = time.time()
             try:
                 info = await recognize_acr(wav)
+                log(f"acrcloud done, found={bool(info)}, {time.time() - t2:.1f}s")
             except Exception as e:
-                print("acrcloud error:", repr(e))
+                log("acrcloud error:", repr(e))
+        return info
+
+
+@app.post("/api/recognize")
+async def recognize(file: UploadFile = File(...), start: float = Form(0)):
+    raw = await file.read()
+    log(f"received {len(raw)} bytes, name={file.filename}, start={start}")
+    if len(raw) > MAX_BYTES:
+        return JSONResponse({"error": "too_big"}, status_code=413)
+
+    suffix = Path(file.filename or "").suffix or ".bin"
+    try:
+        info = await asyncio.wait_for(process(raw, suffix, start), timeout=TOTAL_TIMEOUT)
+    except ValueError:
+        return JSONResponse({"error": "bad_audio"}, status_code=422)
+    except asyncio.TimeoutError:
+        log("overall timeout")
+        return JSONResponse({"error": "timeout"}, status_code=504)
 
     if not info:
+        log("not found")
         return {"found": False}
+    log("found:", info.get("title"))
     return {"found": True, **add_links(info)}
