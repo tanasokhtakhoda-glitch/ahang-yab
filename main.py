@@ -358,18 +358,69 @@ async def tg_send(chat_id, text, reply_to=None):
         log("tg_send error:", repr(e))
 
 
-def format_result(info: dict) -> str:
+def song_label(info: dict) -> str:
+    return f"{info.get('artist') or ''} - {info.get('title') or ''}".strip(" -")
+
+
+def result_text(info: dict) -> str:
     title = html.escape(info.get("title") or "")
     artist = html.escape(info.get("artist") or "")
-    label = html.escape(f"{info.get('artist') or ''} - {info.get('title') or ''}".strip(" -"))
-    yt = html.escape(info["youtube"], quote=True)
-    sp = html.escape(info["spotify"], quote=True)
-    return (
-        f"🎵 <b>{title}</b>\n"
-        f"👤 {artist}\n\n"
-        f'<a href="{yt}">جستجو در یوتیوب</a> | <a href="{sp}">جستجو در اسپاتیفای</a>\n\n'
-        f"برای کپی، روی متن زیر بزنید:\n<code>{label}</code>"
-    )
+    label = html.escape(song_label(info))
+    return f"🎵 <b>{title}</b>\n👤 {artist}\n\n<code>{label}</code>"
+
+
+def result_markups(info: dict) -> list:
+    """ابتدا با دکمه‌ی کپی؛ اگر تلگرام نپذیرفت، بدون آن."""
+    row = [
+        {"text": "▶️ یوتیوب", "url": info["youtube"]},
+        {"text": "🟢 اسپاتیفای", "url": info["spotify"]},
+    ]
+    basic = {"inline_keyboard": [row]}
+    label = song_label(info)
+    if not label:
+        return [basic]
+    full = {
+        "inline_keyboard": [
+            row,
+            [{"text": "📋 کپی نام آهنگ", "copy_text": {"text": label[:256]}}],
+        ]
+    }
+    return [full, basic]
+
+
+async def tg_send_result(chat_id, info: dict, reply_to=None):
+    caption = result_text(info)
+    cover = info.get("cover")
+    base = {"chat_id": chat_id, "parse_mode": "HTML"}
+    if reply_to:
+        base["reply_to_message_id"] = reply_to
+        base["allow_sending_without_reply"] = True
+
+    async with httpx.AsyncClient(timeout=30) as c:
+        for markup in result_markups(info):
+            # اول با عکس کاور
+            if cover:
+                try:
+                    r = await c.post(
+                        f"{TG_API}/sendPhoto",
+                        json={**base, "photo": cover, "caption": caption, "reply_markup": markup},
+                    )
+                    if r.status_code == 200:
+                        return
+                    log("sendPhoto failed:", r.text[:300])
+                except Exception as e:
+                    log("sendPhoto error:", repr(e))
+            # اگر عکس نشد، فقط متن
+            try:
+                r = await c.post(
+                    f"{TG_API}/sendMessage",
+                    json={**base, "text": caption, "reply_markup": markup, "disable_web_page_preview": True},
+                )
+                if r.status_code == 200:
+                    return
+                log("sendMessage failed:", r.text[:300])
+            except Exception as e:
+                log("sendMessage error:", repr(e))
 
 
 async def handle_message(msg: dict):
@@ -432,7 +483,7 @@ async def handle_message(msg: dict):
             mid,
         )
         return
-    await tg_send(chat_id, format_result(add_links(info)), mid)
+    await tg_send_result(chat_id, add_links(info), mid)
 
 
 @app.post("/telegram/webhook")
