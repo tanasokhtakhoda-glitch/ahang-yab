@@ -3,6 +3,7 @@ import html
 import os
 import traceback
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
@@ -19,8 +20,11 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 TG_MAX = 20 * 1024 * 1024  # محدودیت تلگرام برای دانلود فایل توسط ربات
 TOTAL_TIMEOUT = 75  # حداکثر زمان یک شناسایی
+BROADCAST_DELAY = 0.05  # فاصله بین پیام‌های همگانی (حدود ۲۰ پیام در ثانیه)
 
 _FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+_EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_bc_running = False
 
 
 def log(*args):
@@ -95,7 +99,30 @@ async def setup_webhook():
         await db.cleanup_updates()
 
 
-# ---------- مدیران ----------
+# ---------- ابزارهای کمکی ----------
+
+def parse_uid(text) -> Optional[int]:
+    t = (text or "").strip().translate(_EN)
+    if t.isdigit() and len(t) <= 15:
+        return int(t)
+    return None
+
+
+def full_name(row) -> str:
+    row = row or {}
+    return " ".join(x for x in [row.get("first_name"), row.get("last_name")] if x).strip()
+
+
+def display_name(row) -> str:
+    row = row or {}
+    parts = []
+    name = full_name(row)
+    if name:
+        parts.append(html.escape(name))
+    if row.get("username"):
+        parts.append("@" + html.escape(row["username"]))
+    return " ".join(parts) or "بدون نام"
+
 
 async def is_admin(user_id) -> bool:
     if not user_id:
@@ -107,25 +134,55 @@ async def is_admin(user_id) -> bool:
     return user_id in await db.admin_ids()
 
 
+# ---------- منوها ----------
+
 MENU_TEXT = "⚙️ <b>تنظیمات مدیریت</b>\n\nیک گزینه را انتخاب کنید:"
 DB_OFF_TEXT = (
     "⚠️ اتصال به پایگاه داده برقرار نیست.\n"
     "متغیرهای SUPABASE_URL و SUPABASE_SECRET_KEY را در رندر بررسی کنید."
 )
+DB_FAIL_TEXT = "⚠️ ارتباط با پایگاه داده شکست خورد. لاگ رندر را ببینید."
+NOT_STARTED_TEXT = "⚠️ این شناسه ربات را استارت نکرده است."
+SETTINGS_BUTTON = {"inline_keyboard": [[{"text": "⚙️ تنظیمات", "callback_data": "adm:menu"}]]}
 
 
-def menu_markup() -> dict:
+def btn(text, data) -> dict:
+    return {"text": text, "callback_data": data}
+
+
+def back_markup(target="adm:menu", label="🔙 بازگشت") -> dict:
+    return {"inline_keyboard": [[btn(label, target)]]}
+
+
+def menu_markup(is_owner: bool) -> dict:
+    rows = [
+        [btn("📊 آمار کاربران", "adm:users"), btn("🎵 آمار شناسایی", "adm:songs")],
+        [btn("📢 پیام همگانی", "adm:bc")],
+        [btn("🚫 مسدودسازی کاربران", "adm:bans")],
+    ]
+    if is_owner:
+        rows.append([btn("👮 مدیریت مدیران", "adm:admins")])
+    return {"inline_keyboard": rows}
+
+
+BANS_TEXT = (
+    "🚫 <b>مسدودسازی کاربران</b>\n\n"
+    "کاربر مسدودشده نمی‌تواند از ربات استفاده کند.\n"
+    "برای مسدود یا آزاد کردن، شناسه‌ی عددی تلگرام او را می‌فرستید."
+)
+
+
+def bans_markup() -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "📊 آمار کاربران", "callback_data": "adm:users"}],
-            [{"text": "🎵 آمار شناسایی آهنگ", "callback_data": "adm:songs"}],
+            [btn("🚫 مسدود کردن", "adm:ban"), btn("✅ آزاد کردن", "adm:unban")],
+            [btn("📋 فهرست مسدودها", "adm:banlist")],
+            [btn("🔙 بازگشت", "adm:menu")],
         ]
     }
 
 
-BACK_MARKUP = {"inline_keyboard": [[{"text": "🔙 بازگشت", "callback_data": "adm:menu"}]]}
-SETTINGS_BUTTON = {"inline_keyboard": [[{"text": "⚙️ تنظیمات", "callback_data": "adm:menu"}]]}
-
+# ---------- آمار ----------
 
 async def users_stats_text() -> str:
     if not db.ENABLED:
@@ -134,7 +191,7 @@ async def users_stats_text() -> str:
         s = await db.user_stats()
     except Exception as e:
         log("user_stats error:", repr(e))
-        return "⚠️ خواندن آمار از پایگاه داده شکست خورد. لاگ رندر را ببینید."
+        return DB_FAIL_TEXT
     return (
         "📊 <b>آمار کاربران</b>\n\n"
         f"👥 کل کاربران: <b>{fa(s['total'])}</b>\n"
@@ -153,13 +210,273 @@ async def songs_stats_text() -> str:
         s = await db.song_stats()
     except Exception as e:
         log("song_stats error:", repr(e))
-        return "⚠️ خواندن آمار از پایگاه داده شکست خورد. لاگ رندر را ببینید."
+        return DB_FAIL_TEXT
     return (
         "🎵 <b>آمار شناسایی آهنگ</b>\n\n"
         f"🔢 کل شناسایی‌های موفق: <b>{fa(s['total'])}</b>\n"
         f"📅 امروز: <b>{fa(s['today'])}</b>\n"
         f"🗓 ۷ روز اخیر: <b>{fa(s['week'])}</b>"
     )
+
+
+# ---------- نمایش فهرست مدیران و مسدودها ----------
+
+async def admins_view():
+    rows = await db.list_admins()
+    lines = ["👮 <b>مدیران ربات</b>", "", f"👑 مالک: <code>{OWNER_ID}</code>", ""]
+    buttons = []
+    if not rows:
+        lines.append("هنوز مدیر دیگری اضافه نشده است.")
+    for i, row in enumerate(rows, 1):
+        u = row.get("users") or {}
+        lines.append(f"{fa(i)}. {display_name(u)} — <code>{row['telegram_id']}</code>")
+        short = (full_name(u) or str(row["telegram_id"]))[:18]
+        buttons.append([btn(f"🗑 حذف {short}", f"adm:rm:{row['telegram_id']}")])
+    buttons.append([btn("➕ افزودن مدیر", "adm:addadm")])
+    buttons.append([btn("🔙 بازگشت", "adm:menu")])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+async def banlist_view():
+    rows = await db.list_banned()
+    if not rows:
+        return "📋 هیچ کاربری مسدود نیست.", back_markup("adm:bans")
+    lines = ["📋 <b>کاربران مسدود</b>", ""]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{fa(i)}. {display_name(row)} — <code>{row['telegram_id']}</code>")
+    return "\n".join(lines), back_markup("adm:bans")
+
+
+# ---------- پرسیدن ورودی از مدیر ----------
+
+PROMPTS = {
+    "addadm": (
+        "➕ <b>افزودن مدیر</b>\n\n"
+        "شناسه‌ی عددی تلگرام شخص را بفرستید. او باید قبلاً ربات را استارت کرده باشد.\n"
+        "برای لغو /cancel را بزنید.",
+        "adm:admins",
+    ),
+    "ban": (
+        "🚫 <b>مسدود کردن کاربر</b>\n\n"
+        "شناسه‌ی عددی تلگرام کاربر را بفرستید.\nبرای لغو /cancel را بزنید.",
+        "adm:bans",
+    ),
+    "unban": (
+        "✅ <b>آزاد کردن کاربر</b>\n\n"
+        "شناسه‌ی عددی تلگرام کاربر را بفرستید.\nبرای لغو /cancel را بزنید.",
+        "adm:bans",
+    ),
+    "bc": (
+        "📢 <b>پیام همگانی</b>\n\n"
+        "پیامی را که می‌خواهید برای همه‌ی کاربران ارسال شود بفرستید.\n"
+        "متن، عکس، ویدیو، فایل یا پیام فورواردشده، همه پذیرفته می‌شود.\n"
+        "قبل از ارسال، پیش‌نمایش و دکمه‌ی تأیید نشان داده می‌شود.\n"
+        "برای لغو /cancel را بزنید.",
+        "adm:menu",
+    ),
+}
+
+
+async def ask(uid, chat_id, message_id, state):
+    text, cancel_target = PROMPTS[state]
+    await db.set_state(uid, state)
+    await edit_message(chat_id, message_id, text, back_markup(cancel_target, "❌ انصراف"))
+
+
+# ---------- پیام همگانی ----------
+
+CONFIRM_MARKUP = {
+    "inline_keyboard": [
+        [btn("✅ تأیید ارسال", "adm:bcyes")],
+        [btn("❌ انصراف", "adm:menu")],
+    ]
+}
+
+
+async def prepare_broadcast(msg: dict, uid, chat_id):
+    mid = msg["message_id"]
+    try:
+        n = await db.count("users", is_blocked="eq.false", is_banned="eq.false")
+    except Exception as e:
+        log("count recipients error:", repr(e))
+        await send_message(chat_id, DB_FAIL_TEXT)
+        return
+    if n == 0:
+        await db.clear_state(uid)
+        await send_message(chat_id, "کاربری برای ارسال وجود ندارد.", markup=SETTINGS_BUTTON)
+        return
+    # پیش‌نمایش: همان پیام برای خود مدیر کپی می‌شود
+    await tg("copyMessage", {"chat_id": chat_id, "from_chat_id": chat_id, "message_id": mid})
+    await db.set_state(uid, "bc_confirm", {"chat_id": chat_id, "message_id": mid, "count": n})
+    await send_message(
+        chat_id,
+        f"👆 پیش‌نمایش بالا برای <b>{fa(n)}</b> کاربر ارسال می‌شود.\nتأیید می‌کنید؟",
+        markup=CONFIRM_MARKUP,
+    )
+
+
+async def copy_one(client, to_chat, from_chat, message_id) -> str:
+    """نتیجه: ok / blocked / error"""
+    for _ in range(3):
+        try:
+            r = await client.post(
+                f"{TG_API}/copyMessage",
+                json={"chat_id": to_chat, "from_chat_id": from_chat, "message_id": message_id},
+            )
+            data = r.json()
+        except Exception as e:
+            log("copyMessage error:", repr(e))
+            return "error"
+        if data.get("ok"):
+            return "ok"
+        code = data.get("error_code")
+        if code == 429:  # تلگرام سرعت را محدود کرده؛ کمی صبر و دوباره تلاش
+            wait = (data.get("parameters") or {}).get("retry_after", 3)
+            await asyncio.sleep(min(wait + 1, 30))
+            continue
+        if code == 403:  # کاربر ربات را مسدود کرده
+            return "blocked"
+        return "error"
+    return "error"
+
+
+async def run_broadcast(admin_chat, from_chat, message_id):
+    global _bc_running
+    _bc_running = True
+    sent = blocked = failed = 0
+    total = 0
+    try:
+        ids = await db.recipient_ids()
+        total = len(ids)
+        async with httpx.AsyncClient(timeout=30) as client:
+            for uid in ids:
+                res = await copy_one(client, uid, from_chat, message_id)
+                if res == "ok":
+                    sent += 1
+                elif res == "blocked":
+                    blocked += 1
+                    try:
+                        await db.set_blocked(uid, True)
+                    except Exception as e:
+                        log("set_blocked error:", repr(e))
+                else:
+                    failed += 1
+                await asyncio.sleep(BROADCAST_DELAY)
+    except Exception as e:
+        log("broadcast error:", repr(e))
+        traceback.print_exc()
+    finally:
+        _bc_running = False
+    await send_message(
+        admin_chat,
+        "📢 <b>گزارش پیام همگانی</b>\n\n"
+        f"👥 کل گیرندگان: <b>{fa(total)}</b>\n"
+        f"✅ ارسال موفق: <b>{fa(sent)}</b>\n"
+        f"🚫 مسدودکننده‌ی ربات: <b>{fa(blocked)}</b>\n"
+        f"⚠️ خطا: <b>{fa(failed)}</b>",
+        markup=SETTINGS_BUTTON,
+    )
+
+
+async def confirm_broadcast(uid, chat_id, message_id):
+    st = None
+    try:
+        st = await db.get_state(uid)
+    except Exception as e:
+        log("get_state error:", repr(e))
+    if not st or st.get("state") != "bc_confirm":
+        await edit_message(
+            chat_id, message_id,
+            "⌛ این درخواست منقضی شده است. دوباره از بخش «پیام همگانی» شروع کنید.",
+            back_markup(),
+        )
+        return
+    if _bc_running:
+        await edit_message(
+            chat_id, message_id,
+            "⏳ یک ارسال همگانی در حال انجام است. تا پایان آن صبر کنید.",
+            back_markup(),
+        )
+        return
+    data = st.get("data") or {}
+    try:
+        await db.clear_state(uid)
+    except Exception as e:
+        log("clear_state error:", repr(e))
+    await edit_message(
+        chat_id, message_id,
+        "📤 ارسال شروع شد. گزارش پایان کار برایتان فرستاده می‌شود.",
+    )
+    await run_broadcast(chat_id, data.get("chat_id"), data.get("message_id"))
+
+
+# ---------- ورودی‌های مدیر (پاسخ به سؤال‌های ربات) ----------
+
+async def handle_admin_input(msg: dict, uid, chat_id, st: dict) -> bool:
+    """اگر پیام پاسخ یک مرحله بود پردازش می‌کند و True برمی‌گرداند."""
+    state = st.get("state")
+    text = (msg.get("text") or "").strip()
+
+    if text in ("/cancel", "انصراف"):
+        await db.clear_state(uid)
+        await send_message(chat_id, "لغو شد.", markup=SETTINGS_BUTTON)
+        return True
+
+    if state == "bc":
+        await prepare_broadcast(msg, uid, chat_id)
+        return True
+
+    if state in ("addadm", "ban", "unban"):
+        target = parse_uid(text)
+        if target is None:
+            await send_message(chat_id, "⚠️ شناسه نامعتبر است. فقط عدد بفرستید یا /cancel را بزنید.")
+            return True
+        await db.clear_state(uid)
+
+        row = await db.get_user(target)
+        if state == "addadm":
+            if OWNER_ID and target == OWNER_ID:
+                await send_message(chat_id, "مالک ربات همیشه مدیر است.", markup=back_markup("adm:admins"))
+            elif not row:
+                await send_message(chat_id, NOT_STARTED_TEXT, markup=back_markup("adm:admins"))
+            elif target in await db.admin_ids():
+                await send_message(chat_id, "این کاربر از قبل مدیر است.", markup=back_markup("adm:admins"))
+            else:
+                await db.add_admin(target, uid)
+                await send_message(
+                    chat_id,
+                    f"✅ {display_name(row)} (<code>{target}</code>) به مدیران اضافه شد.",
+                    markup=back_markup("adm:admins"),
+                )
+                await send_message(
+                    target,
+                    "👮 شما به‌عنوان مدیر ربات اضافه شدید.\nبرای دیدن تنظیمات /settings را بزنید.",
+                    markup=SETTINGS_BUTTON,
+                )
+            return True
+
+        # مسدود / آزاد کردن
+        if state == "ban" and (target == OWNER_ID or target in await db.admin_ids()):
+            await send_message(chat_id, "نمی‌توان مالک یا مدیر را مسدود کرد.", markup=back_markup("adm:bans"))
+        elif not row:
+            await send_message(chat_id, NOT_STARTED_TEXT, markup=back_markup("adm:bans"))
+        else:
+            await db.set_banned(target, state == "ban")
+            verb = "مسدود شد" if state == "ban" else "آزاد شد"
+            icon = "🚫" if state == "ban" else "✅"
+            await send_message(
+                chat_id,
+                f"{icon} {display_name(row)} (<code>{target}</code>) {verb}.",
+                markup=back_markup("adm:bans"),
+            )
+        return True
+
+    return False
+
+
+# ---------- دکمه‌های منوی مدیریت ----------
+
+OWNER_ONLY = ("admins", "addadm")
 
 
 async def handle_callback(cb: dict):
@@ -170,28 +487,78 @@ async def handle_callback(cb: dict):
     message_id = msg.get("message_id")
     data = cb.get("data") or ""
 
+    async def answer(text=None, alert=False):
+        payload = {"callback_query_id": cb_id}
+        if text:
+            payload.update({"text": text, "show_alert": alert})
+        await tg("answerCallbackQuery", payload)
+
     if not data.startswith("adm:"):
-        await tg("answerCallbackQuery", {"callback_query_id": cb_id})
+        await answer()
         return
     if not await is_admin(uid):
-        await tg(
-            "answerCallbackQuery",
-            {"callback_query_id": cb_id, "text": "شما دسترسی ندارید.", "show_alert": True},
-        )
-        return
-    await tg("answerCallbackQuery", {"callback_query_id": cb_id})
-    if not chat_id or not message_id:
+        await answer("شما دسترسی ندارید.", True)
         return
 
     action = data[4:]
-    if action == "menu":
-        text, markup = MENU_TEXT, menu_markup()
-    elif action == "users":
-        text, markup = await users_stats_text(), BACK_MARKUP
-    elif action == "songs":
-        text, markup = await songs_stats_text(), BACK_MARKUP
-    else:
+    is_owner = bool(OWNER_ID and uid == OWNER_ID)
+    if (action in OWNER_ONLY or action.startswith(("rm:", "rmy:"))) and not is_owner:
+        await answer("فقط مالک ربات به این بخش دسترسی دارد.", True)
         return
+
+    await answer()
+    if not chat_id or not message_id:
+        return
+
+    if action != "menu" and not db.ENABLED:
+        await edit_message(chat_id, message_id, DB_OFF_TEXT, back_markup())
+        return
+
+    try:
+        if action == "bcyes":
+            await confirm_broadcast(uid, chat_id, message_id)
+            return
+
+        if db.ENABLED:
+            await db.clear_state(uid)  # هر جابه‌جایی در منو، مرحله‌ی نیمه‌کاره را لغو می‌کند
+
+        if action == "menu":
+            text, markup = MENU_TEXT, menu_markup(is_owner)
+        elif action == "users":
+            text, markup = await users_stats_text(), back_markup()
+        elif action == "songs":
+            text, markup = await songs_stats_text(), back_markup()
+        elif action == "bans":
+            text, markup = BANS_TEXT, bans_markup()
+        elif action == "banlist":
+            text, markup = await banlist_view()
+        elif action in ("ban", "unban", "bc", "addadm"):
+            await ask(uid, chat_id, message_id, action)
+            return
+        elif action == "admins":
+            text, markup = await admins_view()
+        elif action.startswith("rm:"):
+            target = parse_uid(action[3:])
+            row = await db.get_user(target) if target else None
+            text = f"🗑 مدیر {display_name(row)} (<code>{target}</code>) حذف شود؟"
+            markup = {
+                "inline_keyboard": [
+                    [btn("✅ بله، حذف شود", f"adm:rmy:{target}")],
+                    [btn("❌ خیر", "adm:admins")],
+                ]
+            }
+        elif action.startswith("rmy:"):
+            target = parse_uid(action[4:])
+            if target:
+                await db.remove_admin(target)
+            text, markup = await admins_view()
+            text = "✅ مدیر حذف شد.\n\n" + text
+        else:
+            return
+    except Exception as e:
+        log("callback error:", repr(e))
+        traceback.print_exc()
+        text, markup = DB_FAIL_TEXT, back_markup()
     await edit_message(chat_id, message_id, text, markup)
 
 
@@ -332,12 +699,35 @@ async def handle_message(msg: dict, process, add_links):
         return
 
     text = (msg.get("text") or "").strip()
-    if text.startswith("/start") or text.startswith("/help"):
+
+    # دستورهای اصلی (مرحله‌ی نیمه‌کاره‌ی مدیر را هم لغو می‌کنند)
+    if text.startswith(("/start", "/help", "/settings")) or (admin and text == "تنظیمات"):
+        if admin and db.ENABLED:
+            try:
+                await db.clear_state(uid)
+            except Exception as e:
+                log("clear_state error:", repr(e))
+        if text.startswith("/settings") or text == "تنظیمات":
+            if admin:
+                await send_message(
+                    chat_id, MENU_TEXT,
+                    markup=menu_markup(bool(OWNER_ID and uid == OWNER_ID)),
+                )
+            return
         await send_message(chat_id, WELCOME, markup=SETTINGS_BUTTON if admin else None)
         return
-    if admin and (text.startswith("/settings") or text == "تنظیمات"):
-        await send_message(chat_id, MENU_TEXT, markup=menu_markup())
-        return
+
+    # اگر مدیر وسط یک مرحله است (مثلاً منتظر شناسه یا پیام همگانی)
+    if admin and db.ENABLED:
+        try:
+            st = await db.get_state(uid)
+            if st and await handle_admin_input(msg, uid, chat_id, st):
+                return
+        except Exception as e:
+            log("admin input error:", repr(e))
+            traceback.print_exc()
+            await send_message(chat_id, DB_FAIL_TEXT)
+            return
 
     picked = pick_file(msg)
     if not picked:
