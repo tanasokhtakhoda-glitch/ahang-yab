@@ -207,6 +207,61 @@ async def remove_admin(user_id: int):
     invalidate_admin_cache()
 
 
+# ---------- کانال‌های جوین اجباری ----------
+
+_chan_cache = (0.0, [])
+
+
+def invalidate_channels_cache():
+    global _chan_cache
+    _chan_cache = (0.0, [])
+
+
+async def list_channels(use_cache: bool = True) -> list:
+    """کانال‌های اجباری. برای کم کردن درخواست‌ها ۳۰ ثانیه ذخیره می‌شود."""
+    global _chan_cache
+    ts, rows = _chan_cache
+    if use_cache and time.time() - ts < 30:
+        return rows
+    r = await _req(
+        "GET", "channels",
+        params={
+            "is_active": "eq.true",
+            "select": "chat_id,title,username,invite_link",
+            "order": "id",
+        },
+    )
+    rows = r.json()
+    _chan_cache = (time.time(), rows)
+    return rows
+
+
+async def add_channel(chat_id: int, title: str, username, invite_link, added_by: int):
+    await _req(
+        "POST", "channels",
+        params={"on_conflict": "chat_id"},
+        json={
+            "chat_id": chat_id,
+            "title": title or str(chat_id),
+            "username": username,
+            "invite_link": invite_link,
+            "added_by": added_by,
+            "is_active": True,
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    invalidate_channels_cache()
+
+
+async def remove_channel(chat_id: int):
+    await _req(
+        "DELETE", "channels",
+        params={"chat_id": f"eq.{chat_id}"},
+        prefer="return=minimal",
+    )
+    invalidate_channels_cache()
+
+
 # ---------- وضعیت گفتگو با مدیر (مثلاً منتظر دریافت شناسه) ----------
 
 async def set_state(user_id: int, state: str, data: Optional[dict] = None):
