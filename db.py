@@ -7,10 +7,13 @@ from typing import Optional
 import httpx
 
 URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+if URL.endswith("/rest/v1"):  # اگر آدرس با /rest/v1 وارد شده بود، آن را حذف می‌کنیم
+    URL = URL[: -len("/rest/v1")].rstrip("/")
 KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 ENABLED = bool(URL and KEY)
 
 TEHRAN = timezone(timedelta(hours=3, minutes=30))  # ساعت ایران (بدون ساعت تابستانی)
+STATE_TTL = timedelta(minutes=30)  # اگر مدیر بیش از این مدت جواب نداد، مرحله لغو می‌شود
 
 _client: Optional[httpx.AsyncClient] = None
 _admin_cache = (0.0, set())
@@ -83,6 +86,19 @@ async def upsert_user(u: dict) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+async def get_user(user_id: int) -> Optional[dict]:
+    r = await _req(
+        "GET", "users",
+        params={
+            "telegram_id": f"eq.{user_id}",
+            "select": "telegram_id,first_name,last_name,username,is_banned",
+            "limit": "1",
+        },
+    )
+    rows = r.json()
+    return rows[0] if rows else None
+
+
 async def set_blocked(user_id: int, blocked: bool):
     await _req(
         "PATCH", "users",
@@ -92,7 +108,59 @@ async def set_blocked(user_id: int, blocked: bool):
     )
 
 
+async def set_banned(user_id: int, banned: bool) -> bool:
+    """کاربر را مسدود یا آزاد می‌کند. اگر چنین کاربری ثبت نشده باشد False برمی‌گرداند."""
+    r = await _req(
+        "PATCH", "users",
+        params={"telegram_id": f"eq.{user_id}"},
+        json={"is_banned": banned},
+        prefer="return=representation",
+    )
+    return bool(r.json())
+
+
+async def list_banned(limit: int = 30) -> list:
+    r = await _req(
+        "GET", "users",
+        params={
+            "is_banned": "eq.true",
+            "select": "telegram_id,first_name,last_name,username",
+            "order": "telegram_id",
+            "limit": str(limit),
+        },
+    )
+    return r.json()
+
+
+async def recipient_ids() -> list:
+    """شناسه‌ی همه‌ی کاربرانی که ربات را مسدود نکرده‌اند و خودشان مسدود نیستند."""
+    ids, offset = [], 0
+    while True:
+        r = await _req(
+            "GET", "users",
+            params={
+                "select": "telegram_id",
+                "is_blocked": "eq.false",
+                "is_banned": "eq.false",
+                "order": "telegram_id",
+                "limit": "1000",
+                "offset": str(offset),
+            },
+        )
+        rows = r.json()
+        ids += [int(x["telegram_id"]) for x in rows]
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return ids
+
+
 # ---------- مدیران ----------
+
+def invalidate_admin_cache():
+    global _admin_cache
+    _admin_cache = (0.0, set())
+
 
 async def admin_ids() -> set:
     """فهرست مدیران (به‌جز مالک). برای کم کردن درخواست‌ها ۶۰ ثانیه ذخیره می‌شود."""
@@ -107,6 +175,82 @@ async def admin_ids() -> set:
     except Exception as e:
         log("admin_ids error:", repr(e))
     return ids
+
+
+async def list_admins() -> list:
+    r = await _req(
+        "GET", "admins",
+        params={
+            "select": "telegram_id,created_at,users(first_name,last_name,username)",
+            "order": "created_at",
+        },
+    )
+    return r.json()
+
+
+async def add_admin(user_id: int, added_by: int):
+    await _req(
+        "POST", "admins",
+        params={"on_conflict": "telegram_id"},
+        json={"telegram_id": user_id, "added_by": added_by},
+        prefer="resolution=ignore-duplicates,return=minimal",
+    )
+    invalidate_admin_cache()
+
+
+async def remove_admin(user_id: int):
+    await _req(
+        "DELETE", "admins",
+        params={"telegram_id": f"eq.{user_id}"},
+        prefer="return=minimal",
+    )
+    invalidate_admin_cache()
+
+
+# ---------- وضعیت گفتگو با مدیر (مثلاً منتظر دریافت شناسه) ----------
+
+async def set_state(user_id: int, state: str, data: Optional[dict] = None):
+    await _req(
+        "POST", "admin_states",
+        params={"on_conflict": "telegram_id"},
+        json={
+            "telegram_id": user_id,
+            "state": state,
+            "data": data or {},
+            "updated_at": iso(now_utc()),
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+async def get_state(user_id: int) -> Optional[dict]:
+    r = await _req(
+        "GET", "admin_states",
+        params={
+            "telegram_id": f"eq.{user_id}",
+            "select": "state,data,updated_at",
+            "limit": "1",
+        },
+    )
+    rows = r.json()
+    if not rows:
+        return None
+    row = rows[0]
+    try:
+        ts = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+        if now_utc() - ts > STATE_TTL:
+            return None
+    except Exception:
+        pass
+    return row
+
+
+async def clear_state(user_id: int):
+    await _req(
+        "DELETE", "admin_states",
+        params={"telegram_id": f"eq.{user_id}"},
+        prefer="return=minimal",
+    )
 
 
 # ---------- به‌روزرسانی‌های تلگرام (جلوگیری از پردازش تکراری) ----------
