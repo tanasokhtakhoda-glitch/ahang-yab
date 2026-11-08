@@ -262,6 +262,110 @@ async def remove_channel(chat_id: int):
     invalidate_channels_cache()
 
 
+# ---------- تنظیمات ربات (مثل حالت تعمیر) ----------
+
+_settings_cache: dict = {}
+
+
+async def get_setting(key: str, default=None):
+    """مقدار یک تنظیم را می‌خواند (۱۵ ثانیه در حافظه نگه داشته می‌شود)."""
+    hit = _settings_cache.get(key)
+    if hit and time.time() - hit[0] < 15:
+        return hit[1]
+    r = await _req(
+        "GET", "bot_settings",
+        params={"key": f"eq.{key}", "select": "value", "limit": "1"},
+    )
+    rows = r.json()
+    val = rows[0]["value"] if rows else default
+    _settings_cache[key] = (time.time(), val)
+    return val
+
+
+async def set_setting(key: str, value):
+    await _req(
+        "POST", "bot_settings",
+        params={"on_conflict": "key"},
+        json={"key": key, "value": value, "updated_at": iso(now_utc())},
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    _settings_cache[key] = (time.time(), value)
+
+
+# ---------- پیام‌های پین‌شده ----------
+
+async def create_pin(label: str, created_by: int) -> int:
+    r = await _req(
+        "POST", "pins",
+        json={"label": (label or "پیام")[:100], "created_by": created_by},
+        prefer="return=representation",
+    )
+    return int(r.json()[0]["id"])
+
+
+async def add_deliveries(pin_id: int, rows: list):
+    """rows: فهرست (شناسه‌ی کاربر، شناسه‌ی پیام در گفتگوی او)"""
+    if not rows:
+        return
+    await _req(
+        "POST", "pin_deliveries",
+        params={"on_conflict": "pin_id,telegram_id"},
+        json=[{"pin_id": pin_id, "telegram_id": u, "message_id": m} for u, m in rows],
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+async def list_pins(limit: int = 10) -> list:
+    r = await _req(
+        "GET", "pins",
+        params={"select": "id,label,created_at", "order": "id.desc", "limit": str(limit)},
+    )
+    return r.json()
+
+
+async def get_pin(pin_id: int) -> Optional[dict]:
+    r = await _req(
+        "GET", "pins",
+        params={"id": f"eq.{pin_id}", "select": "id,label", "limit": "1"},
+    )
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+async def count_deliveries(pin_id: int) -> int:
+    return await count("pin_deliveries", pin_id=f"eq.{pin_id}")
+
+
+async def pin_deliveries(pin_id: int) -> list:
+    """فهرست (شناسه‌ی کاربر، شناسه‌ی پیام) برای یک پین."""
+    out, offset = [], 0
+    while True:
+        r = await _req(
+            "GET", "pin_deliveries",
+            params={
+                "pin_id": f"eq.{pin_id}",
+                "select": "telegram_id,message_id",
+                "order": "telegram_id",
+                "limit": "1000",
+                "offset": str(offset),
+            },
+        )
+        rows = r.json()
+        out += [(int(x["telegram_id"]), int(x["message_id"])) for x in rows]
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return out
+
+
+async def delete_pin(pin_id: int):
+    await _req(
+        "DELETE", "pins",
+        params={"id": f"eq.{pin_id}"},
+        prefer="return=minimal",
+    )
+
+
 # ---------- وضعیت گفتگو با مدیر (مثلاً منتظر دریافت شناسه) ----------
 
 async def set_state(user_id: int, state: str, data: Optional[dict] = None):
