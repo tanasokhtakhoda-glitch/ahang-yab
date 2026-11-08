@@ -31,7 +31,7 @@ BROADCAST_DELAY = 0.05  # فاصله بین پیام‌های همگانی (حد
 
 _FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 _EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-_bc_running = False
+_bulk_running = False
 _joined_cache = {}  # (کاربر، کانال) -> زمان انقضای نتیجه‌ی «عضو است»
 _alerted = {}  # کانال -> آخرین زمان هشدار به مالک
 JOIN_CACHE_SECONDS = 60
@@ -176,9 +176,10 @@ def back_markup(target="adm:menu", label="🔙 بازگشت") -> dict:
 def menu_markup(is_owner: bool) -> dict:
     rows = [
         [btn("📊 آمار کاربران", "adm:users"), btn("🎵 آمار شناسایی", "adm:songs")],
-        [btn("📢 پیام همگانی", "adm:bc")],
+        [btn("📢 پیام همگانی", "adm:bcm")],
         [btn("🚫 مسدودسازی کاربران", "adm:bans")],
-        [btn("🔒 جوین اجباری", "adm:jc")],
+        [btn("🔒 جویین اجباری", "adm:jc")],
+        [btn("🛠 حالت تعمیر", "adm:mt")],
     ]
     if is_owner:
         rows.append([btn("👮 مدیریت مدیران", "adm:admins")])
@@ -302,7 +303,15 @@ PROMPTS = {
         "متن، عکس، ویدیو، فایل یا پیام فورواردشده، همه پذیرفته می‌شود.\n"
         "قبل از ارسال، پیش‌نمایش و دکمه‌ی تأیید نشان داده می‌شود.\n"
         "برای لغو /cancel را بزنید.",
-        "adm:menu",
+        "adm:bcm",
+    ),
+    "bcp": (
+        "📌 <b>ارسال و پین کردن</b>\n\n"
+        "پیامی را که می‌خواهید برای همه‌ی کاربران ارسال و در بالای گفتگوی ربات آن‌ها پین شود بفرستید.\n"
+        "متن، عکس، ویدیو یا فایل پذیرفته می‌شود.\n"
+        "قبل از ارسال، پیش‌نمایش و دکمه‌ی تأیید نشان داده می‌شود.\n"
+        "برای لغو /cancel را بزنید.",
+        "adm:bcm",
     ),
 }
 
@@ -313,17 +322,51 @@ async def ask(uid, chat_id, message_id, state):
     await edit_message(chat_id, message_id, text, back_markup(cancel_target, "❌ انصراف"))
 
 
-# ---------- پیام همگانی ----------
+# ---------- پیام همگانی و پین ----------
+
+BCM_TEXT = "📢 <b>پیام همگانی</b>\n\nیک گزینه را انتخاب کنید:"
+BUSY_TEXT = "⏳ یک عملیات همگانی (ارسال یا برداشتن پین) در حال انجام است. تا پایان آن صبر کنید."
 
 CONFIRM_MARKUP = {
     "inline_keyboard": [
         [btn("✅ تأیید ارسال", "adm:bcyes")],
-        [btn("❌ انصراف", "adm:menu")],
+        [btn("❌ انصراف", "adm:bcm")],
     ]
 }
 
 
-async def prepare_broadcast(msg: dict, uid, chat_id):
+def bcm_markup() -> dict:
+    return {
+        "inline_keyboard": [
+            [btn("📢 ارسال پیام همگانی", "adm:bc")],
+            [btn("📌 ارسال و پین کردن", "adm:bcp")],
+            [btn("📋 پیام‌های پین‌شده", "adm:pins")],
+            [btn("🔙 بازگشت", "adm:menu")],
+        ]
+    }
+
+
+def message_label(msg: dict) -> str:
+    """یک عنوان کوتاه برای شناسایی پیام در فهرست پین‌ها."""
+    text = (msg.get("text") or msg.get("caption") or "").strip().replace("\n", " ")
+    kind = ""
+    if msg.get("photo"):
+        kind = "🖼 عکس"
+    elif msg.get("video"):
+        kind = "🎬 ویدیو"
+    elif msg.get("audio"):
+        kind = "🎵 آهنگ"
+    elif msg.get("voice"):
+        kind = "🎙 صوت"
+    elif msg.get("document"):
+        kind = "📎 فایل"
+    if len(text) > 40:
+        text = text[:40] + "…"
+    label = f"{kind}: {text}" if kind and text else (kind or text or "پیام")
+    return label[:100]
+
+
+async def prepare_broadcast(msg: dict, uid, chat_id, pin: bool = False):
     mid = msg["message_id"]
     try:
         n = await db.count("users", is_blocked="eq.false", is_banned="eq.false")
@@ -337,52 +380,89 @@ async def prepare_broadcast(msg: dict, uid, chat_id):
         return
     # پیش‌نمایش: همان پیام برای خود مدیر کپی می‌شود
     await tg("copyMessage", {"chat_id": chat_id, "from_chat_id": chat_id, "message_id": mid})
-    await db.set_state(uid, "bc_confirm", {"chat_id": chat_id, "message_id": mid, "count": n})
+    await db.set_state(
+        uid, "bc_confirm",
+        {"chat_id": chat_id, "message_id": mid, "count": n, "pin": pin, "label": message_label(msg)},
+    )
+    extra = " و در بالای گفتگوی آن‌ها پین" if pin else ""
     await send_message(
         chat_id,
-        f"👆 پیش‌نمایش بالا برای <b>{fa(n)}</b> کاربر ارسال می‌شود.\nتأیید می‌کنید؟",
+        f"👆 پیش‌نمایش بالا برای <b>{fa(n)}</b> کاربر ارسال{extra} می‌شود.\nتأیید می‌کنید؟",
         markup=CONFIRM_MARKUP,
     )
 
 
-async def copy_one(client, to_chat, from_chat, message_id) -> str:
-    """نتیجه: ok / blocked / error"""
+async def api_call(client, method: str, payload: dict) -> dict:
+    """یک درخواست به تلگرام می‌زند و اگر محدودیت سرعت (۴۲۹) خورد کمی صبر و دوباره تلاش می‌کند."""
     for _ in range(3):
         try:
-            r = await client.post(
-                f"{TG_API}/copyMessage",
-                json={"chat_id": to_chat, "from_chat_id": from_chat, "message_id": message_id},
-            )
+            r = await client.post(f"{TG_API}/{method}", json=payload)
             data = r.json()
         except Exception as e:
-            log("copyMessage error:", repr(e))
-            return "error"
-        if data.get("ok"):
-            return "ok"
-        code = data.get("error_code")
-        if code == 429:  # تلگرام سرعت را محدود کرده؛ کمی صبر و دوباره تلاش
-            wait = (data.get("parameters") or {}).get("retry_after", 3)
-            await asyncio.sleep(min(wait + 1, 30))
-            continue
-        if code == 403:  # کاربر ربات را مسدود کرده
-            return "blocked"
-        return "error"
+            log(method, "error:", repr(e))
+            return {"ok": False, "error_code": 0}
+        if data.get("ok") or data.get("error_code") != 429:
+            return data
+        wait = (data.get("parameters") or {}).get("retry_after", 3)
+        await asyncio.sleep(min(wait + 1, 30))
+    return {"ok": False, "error_code": 429}
+
+
+async def copy_one(client, to_chat, from_chat, message_id):
+    """نتیجه: (ok یا blocked یا error، شناسه‌ی پیام جدید)"""
+    data = await api_call(
+        client, "copyMessage",
+        {"chat_id": to_chat, "from_chat_id": from_chat, "message_id": message_id},
+    )
+    if data.get("ok"):
+        return "ok", (data.get("result") or {}).get("message_id")
+    if data.get("error_code") == 403:  # کاربر ربات را مسدود کرده
+        return "blocked", None
+    return "error", None
+
+
+async def pin_one(client, chat_id, message_id) -> bool:
+    data = await api_call(
+        client, "pinChatMessage",
+        {"chat_id": chat_id, "message_id": message_id, "disable_notification": True},
+    )
+    return bool(data.get("ok"))
+
+
+async def unpin_one(client, chat_id, message_id) -> str:
+    data = await api_call(
+        client, "unpinChatMessage", {"chat_id": chat_id, "message_id": message_id}
+    )
+    if data.get("ok"):
+        return "ok"
+    code = data.get("error_code")
+    if code == 400 and "not found" in str(data.get("description") or "").lower():
+        return "ok"  # قبلاً برداشته شده یا پیام پاک شده
+    if code == 403:
+        return "blocked"
     return "error"
 
 
-async def run_broadcast(admin_chat, from_chat, message_id):
-    global _bc_running
-    _bc_running = True
-    sent = blocked = failed = 0
+async def run_broadcast(admin_chat, from_chat, message_id, pin_id=None):
+    global _bulk_running
+    _bulk_running = True
+    sent = blocked = failed = pinned = 0
     total = 0
+    buffer = []
     try:
         ids = await db.recipient_ids()
         total = len(ids)
         async with httpx.AsyncClient(timeout=30) as client:
             for uid in ids:
-                res = await copy_one(client, uid, from_chat, message_id)
+                res, new_mid = await copy_one(client, uid, from_chat, message_id)
                 if res == "ok":
                     sent += 1
+                    if pin_id and new_mid and await pin_one(client, uid, new_mid):
+                        pinned += 1
+                        buffer.append((uid, new_mid))
+                        if len(buffer) >= 200:
+                            await db.add_deliveries(pin_id, buffer)
+                            buffer = []
                 elif res == "blocked":
                     blocked += 1
                     try:
@@ -396,16 +476,85 @@ async def run_broadcast(admin_chat, from_chat, message_id):
         log("broadcast error:", repr(e))
         traceback.print_exc()
     finally:
-        _bc_running = False
+        _bulk_running = False
+        if pin_id and buffer:
+            try:
+                await db.add_deliveries(pin_id, buffer)
+            except Exception as e:
+                log("add_deliveries error:", repr(e))
+    pin_line = f"\n📌 پین‌شده: <b>{fa(pinned)}</b>" if pin_id else ""
     await send_message(
         admin_chat,
         "📢 <b>گزارش پیام همگانی</b>\n\n"
         f"👥 کل گیرندگان: <b>{fa(total)}</b>\n"
-        f"✅ ارسال موفق: <b>{fa(sent)}</b>\n"
+        f"✅ ارسال موفق: <b>{fa(sent)}</b>{pin_line}\n"
         f"🚫 مسدودکننده‌ی ربات: <b>{fa(blocked)}</b>\n"
         f"⚠️ خطا: <b>{fa(failed)}</b>",
         markup=SETTINGS_BUTTON,
     )
+
+
+async def run_unpin(admin_chat, pin_ids: list):
+    global _bulk_running
+    _bulk_running = True
+    ok = blocked = failed = 0
+    done_pins = 0
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for pid in pin_ids:
+                for uid, mid in await db.pin_deliveries(pid):
+                    res = await unpin_one(client, uid, mid)
+                    if res == "ok":
+                        ok += 1
+                    elif res == "blocked":
+                        blocked += 1
+                    else:
+                        failed += 1
+                    await asyncio.sleep(BROADCAST_DELAY)
+                await db.delete_pin(pid)
+                done_pins += 1
+    except Exception as e:
+        log("unpin error:", repr(e))
+        traceback.print_exc()
+    finally:
+        _bulk_running = False
+    await send_message(
+        admin_chat,
+        "📍 <b>گزارش برداشتن پین</b>\n\n"
+        f"📌 پیام‌های پردازش‌شده: <b>{fa(done_pins)}</b>\n"
+        f"✅ برداشته شد: <b>{fa(ok)}</b>\n"
+        f"🚫 مسدودکننده‌ی ربات: <b>{fa(blocked)}</b>\n"
+        f"⚠️ خطا: <b>{fa(failed)}</b>",
+        markup=SETTINGS_BUTTON,
+    )
+
+
+async def start_unpin(chat_id, message_id, pin_ids: list):
+    if _bulk_running:
+        await edit_message(chat_id, message_id, BUSY_TEXT, back_markup("adm:pins"))
+        return
+    await edit_message(
+        chat_id, message_id,
+        "📍 برداشتن پین شروع شد. گزارش پایان کار برایتان فرستاده می‌شود.",
+    )
+    await run_unpin(chat_id, pin_ids)
+
+
+async def pins_view():
+    pins = await db.list_pins()
+    lines = ["📌 <b>پیام‌های پین‌شده</b>", ""]
+    buttons = []
+    if not pins:
+        lines.append("هیچ پیام پین‌شده‌ای ثبت نشده است.")
+    else:
+        counts = await asyncio.gather(*(db.count_deliveries(p["id"]) for p in pins))
+        for i, (p, n) in enumerate(zip(pins, counts), 1):
+            lines.append(f"{fa(i)}. {html.escape(p.get('label') or '')} — در گفتگوی <b>{fa(n)}</b> کاربر")
+            short = (p.get("label") or "پیام")[:16]
+            buttons.append([btn(f"📍 برداشتن پین «{short}»", f"adm:unpin:{p['id']}")])
+        buttons.append([btn("🧹 برداشتن همه‌ی پین‌ها", "adm:unpinall")])
+    buttons.append([btn("🔙 بازگشت", "adm:bcm")])
+    return "\n".join(lines), {"inline_keyboard": buttons}
 
 
 async def confirm_broadcast(uid, chat_id, message_id):
@@ -418,17 +567,25 @@ async def confirm_broadcast(uid, chat_id, message_id):
         await edit_message(
             chat_id, message_id,
             "⌛ این درخواست منقضی شده است. دوباره از بخش «پیام همگانی» شروع کنید.",
-            back_markup(),
+            back_markup("adm:bcm"),
         )
         return
-    if _bc_running:
-        await edit_message(
-            chat_id, message_id,
-            "⏳ یک ارسال همگانی در حال انجام است. تا پایان آن صبر کنید.",
-            back_markup(),
-        )
+    if _bulk_running:
+        await edit_message(chat_id, message_id, BUSY_TEXT, back_markup("adm:bcm"))
         return
     data = st.get("data") or {}
+    pin_id = None
+    if data.get("pin"):
+        try:
+            pin_id = await db.create_pin(data.get("label") or "پیام", uid)
+        except Exception as e:
+            log("create_pin error:", repr(e))
+            await edit_message(
+                chat_id, message_id,
+                "⚠️ ثبت پین در پایگاه داده شکست خورد. مطمئن شوید SQL جدول‌های پین را اجرا کرده‌اید.",
+                back_markup("adm:bcm"),
+            )
+            return
     try:
         await db.clear_state(uid)
     except Exception as e:
@@ -437,7 +594,37 @@ async def confirm_broadcast(uid, chat_id, message_id):
         chat_id, message_id,
         "📤 ارسال شروع شد. گزارش پایان کار برایتان فرستاده می‌شود.",
     )
-    await run_broadcast(chat_id, data.get("chat_id"), data.get("message_id"))
+    await run_broadcast(chat_id, data.get("chat_id"), data.get("message_id"), pin_id)
+
+
+# ---------- حالت تعمیر ----------
+
+MAINTENANCE_USER_TEXT = "🛠 ربات در حال تعمیر است. لطفاً کمی بعد دوباره امتحان کنید."
+
+
+async def maintenance_on() -> bool:
+    if not db.ENABLED:
+        return False
+    try:
+        return bool(await db.get_setting("maintenance", False))
+    except Exception as e:
+        log("maintenance check error:", repr(e))
+        return False  # اگر خوانده نشد، ربات را قفل نمی‌کنیم
+
+
+async def maintenance_view(prefix: str = ""):
+    on = bool(await db.get_setting("maintenance", False))
+    status = "🔴 روشن" if on else "🟢 خاموش"
+    text = (
+        prefix
+        + "🛠 <b>حالت تعمیر</b>\n\n"
+        f"وضعیت فعلی: <b>{status}</b>\n\n"
+        "وقتی روشن باشد، کاربران عادی فقط پیام «ربات در حال تعمیر است» را می‌بینند "
+        "و نمی‌توانند از ربات استفاده کنند. مدیران همچنان دسترسی کامل دارند.\n"
+        "برنامه‌ی وب تحت تأثیر قرار نمی‌گیرد."
+    )
+    toggle = btn("🟢 خاموش کردن", "adm:mtoff") if on else btn("🔴 روشن کردن", "adm:mton")
+    return text, {"inline_keyboard": [[toggle], [btn("🔙 بازگشت", "adm:menu")]]}
 
 
 # ---------- ورودی‌های مدیر (پاسخ به سؤال‌های ربات) ----------
@@ -452,8 +639,8 @@ async def handle_admin_input(msg: dict, uid, chat_id, st: dict) -> bool:
         await send_message(chat_id, "لغو شد.", markup=SETTINGS_BUTTON)
         return True
 
-    if state == "bc":
-        await prepare_broadcast(msg, uid, chat_id)
+    if state in ("bc", "bcp"):
+        await prepare_broadcast(msg, uid, chat_id, pin=(state == "bcp"))
         return True
 
     if state == "jcadd":
@@ -508,7 +695,7 @@ async def handle_admin_input(msg: dict, uid, chat_id, st: dict) -> bool:
     return False
 
 
-# ---------- جوین اجباری ----------
+# ---------- جویین اجباری ----------
 
 JOIN_OK = ("creator", "administrator", "member")
 
@@ -601,6 +788,12 @@ async def handle_join_check(cb: dict):
     msg = cb.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     message_id = msg.get("message_id")
+    if not await is_admin(uid) and await maintenance_on():
+        await tg(
+            "answerCallbackQuery",
+            {"callback_query_id": cb_id, "text": MAINTENANCE_USER_TEXT, "show_alert": True},
+        )
+        return
     try:
         status = await join_status(uid) if db.ENABLED else []
     except Exception as e:
@@ -623,7 +816,7 @@ async def handle_join_check(cb: dict):
 
 async def jc_view():
     chans = await db.list_channels(use_cache=False)
-    lines = ["🔒 <b>جوین اجباری</b>", ""]
+    lines = ["🔒 <b>جویین اجباری</b>", ""]
     buttons = []
     if not chans:
         lines.append("هنوز کانالی اضافه نشده است. فعلاً همه می‌توانند بدون عضویت از ربات استفاده کنند.")
@@ -705,7 +898,7 @@ async def handle_channel_input(msg: dict, uid, chat_id):
     await db.clear_state(uid)
     await send_message(
         chat_id,
-        f"✅ کانال «{html.escape(title)}» به جوین اجباری اضافه شد.",
+        f"✅ کانال «{html.escape(title)}» به جویین اجباری اضافه شد.",
         markup=back_markup("adm:jc"),
     )
 
@@ -771,13 +964,62 @@ async def handle_callback(cb: dict):
             text, markup = BANS_TEXT, bans_markup()
         elif action == "banlist":
             text, markup = await banlist_view()
+        elif action == "bcm":
+            text, markup = BCM_TEXT, bcm_markup()
+        elif action == "pins":
+            text, markup = await pins_view()
+        elif action.startswith("unpin:"):
+            pid = parse_int(action[6:])
+            pin = await db.get_pin(pid) if pid is not None else None
+            if not pin:
+                text, markup = "این پین دیگر وجود ندارد.", back_markup("adm:pins")
+            else:
+                text = f"📍 پین «{html.escape(pin.get('label') or '')}» از گفتگوی همه‌ی کاربران برداشته شود؟"
+                markup = {
+                    "inline_keyboard": [
+                        [btn("✅ بله، برداشته شود", f"adm:unpiny:{pid}")],
+                        [btn("❌ خیر", "adm:pins")],
+                    ]
+                }
+        elif action.startswith("unpiny:"):
+            pid = parse_int(action[7:])
+            if pid is None:
+                return
+            await start_unpin(chat_id, message_id, [pid])
+            return
+        elif action == "unpinall":
+            pins = await db.list_pins(100)
+            if not pins:
+                text, markup = "هیچ پیام پین‌شده‌ای ثبت نشده است.", back_markup("adm:pins")
+            else:
+                text = f"🧹 همه‌ی <b>{fa(len(pins))}</b> پیام پین‌شده از گفتگوی همه‌ی کاربران برداشته شود؟"
+                markup = {
+                    "inline_keyboard": [
+                        [btn("✅ بله، همه برداشته شوند", "adm:unpinally")],
+                        [btn("❌ خیر", "adm:pins")],
+                    ]
+                }
+        elif action == "unpinally":
+            pins = await db.list_pins(100)
+            if not pins:
+                text, markup = "هیچ پیام پین‌شده‌ای ثبت نشده است.", back_markup("adm:pins")
+            else:
+                await start_unpin(chat_id, message_id, [p["id"] for p in pins])
+                return
+        elif action == "mt":
+            text, markup = await maintenance_view()
+        elif action in ("mton", "mtoff"):
+            await db.set_setting("maintenance", action == "mton")
+            text, markup = await maintenance_view(
+                "✅ حالت تعمیر روشن شد.\n\n" if action == "mton" else "✅ حالت تعمیر خاموش شد.\n\n"
+            )
         elif action == "jc":
             text, markup = await jc_view()
         elif action.startswith("jcrm:"):
             cid = parse_int(action[5:])
             chans = await db.list_channels(use_cache=False)
             title = next((c.get("title") for c in chans if c["chat_id"] == cid), None) or str(cid)
-            text = f"🗑 کانال «{html.escape(title)}» از جوین اجباری حذف شود؟"
+            text = f"🗑 کانال «{html.escape(title)}» از جویین اجباری حذف شود؟"
             markup = {
                 "inline_keyboard": [
                     [btn("✅ بله، حذف شود", f"adm:jcrmy:{cid}")],
@@ -790,7 +1032,7 @@ async def handle_callback(cb: dict):
                 await db.remove_channel(cid)
             text, markup = await jc_view()
             text = "✅ کانال حذف شد.\n\n" + text
-        elif action in ("ban", "unban", "bc", "addadm", "jcadd"):
+        elif action in ("ban", "unban", "bc", "bcp", "addadm", "jcadd"):
             await ask(uid, chat_id, message_id, action)
             return
         elif action == "admins":
@@ -956,7 +1198,12 @@ async def handle_message(msg: dict, process, add_links):
         await send_message(chat_id, "⛔ دسترسی شما به این ربات مسدود شده است.")
         return
 
-    # جوین اجباری: کاربران عادی باید در کانال‌های تعیین‌شده عضو باشند (مدیران معاف‌اند)
+    # حالت تعمیر: فقط مدیران می‌توانند از ربات استفاده کنند
+    if not admin and await maintenance_on():
+        await send_message(chat_id, MAINTENANCE_USER_TEXT)
+        return
+
+    # جویین اجباری: کاربران عادی باید در کانال‌های تعیین‌شده عضو باشند (مدیران معاف‌اند)
     if not admin and db.ENABLED and uid:
         if await enforce_join(uid, chat_id):
             return
@@ -1003,7 +1250,7 @@ async def handle_message(msg: dict, process, add_links):
         return
 
     start = parse_start(msg.get("caption"))
-    await send_message(chat_id, "در حال شناسایی… (اگر سرور خواب بوده، تا یک دقیقه طول می‌کشد)", mid)
+    await send_message(chat_id, "در حال شناسایی… (ممکن است تا یک دقیقه طول بکشد)", mid)
 
     try:
         async with httpx.AsyncClient(timeout=60) as c:
