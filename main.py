@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw
 from shazamio import Shazam
 
 import bot
+import db
 
 BASE = Path(__file__).parent
 MAX_BYTES = 30 * 1024 * 1024  # حداکثر حجم فایل ورودی (برنامه‌ی وب)
@@ -29,14 +30,46 @@ TOTAL_TIMEOUT = 75  # حداکثر زمان کل یک شناسایی
 seen_updates = deque(maxlen=300)
 shazam = Shazam()
 
+# پیام‌های سیستمی تلگرام (مثل «پیامی پین شد») که نباید جواب داده شوند
+SERVICE_KEYS = (
+    "pinned_message", "new_chat_members", "left_chat_member", "new_chat_title",
+    "new_chat_photo", "delete_chat_photo", "group_chat_created", "supergroup_chat_created",
+    "channel_chat_created", "message_auto_delete_timer_changed", "migrate_to_chat_id",
+    "migrate_from_chat_id", "video_chat_started", "video_chat_ended", "video_chat_scheduled",
+    "video_chat_participants_invited", "forum_topic_created", "write_access_allowed",
+)
+
+
+def is_service_update(update: dict) -> bool:
+    """پیام‌های سیستمی و پیام‌هایی که از طرف یک ربات آمده‌اند."""
+    msg = update.get("message")
+    if not msg:
+        return False
+    return any(k in msg for k in SERVICE_KEYS) or bool((msg.get("from") or {}).get("is_bot"))
+
 
 def log(*args):
     print("[recognize]", *args, flush=True)
 
 
+async def cleanup_self_user():
+    """اگر خود ربات به‌اشتباه به‌عنوان کاربر ثبت شده بود، آن را از پایگاه داده پاک می‌کند."""
+    if not (db.ENABLED and bot.BOT_ID):
+        return
+    try:
+        await db._req(
+            "DELETE", "users",
+            params={"telegram_id": f"eq.{bot.BOT_ID}"},
+            prefer="return=minimal",
+        )
+    except Exception as e:
+        log("cleanup_self_user error:", repr(e))
+
+
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     asyncio.create_task(bot.setup_webhook())
+    asyncio.create_task(cleanup_self_user())
     yield
 
 
@@ -275,6 +308,8 @@ async def telegram_webhook(request: Request, background: BackgroundTasks):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != bot.WEBHOOK_SECRET:
         return JSONResponse({"ok": False}, status_code=403)
     update = await request.json()
+    if is_service_update(update):  # مثلاً پیام سیستمی «پیامی پین شد»؛ جواب لازم ندارد
+        return {"ok": True}
     uid = update.get("update_id")
     if uid in seen_updates:  # تلگرام گاهی همان پیام را دوباره می‌فرستد
         return {"ok": True}
